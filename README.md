@@ -1,5 +1,7 @@
 # TARA
-This is the source code for paper "[Topic-oriented Adversarial Attacks against Black-box Neural Ranking Models](https://dl.acm.org/doi/10.1145/3539618.3591777)".
+This is the source code for the paper "[Topic-oriented Adversarial Attacks against Black-box Neural Ranking Models](https://dl.acm.org/doi/10.1145/3539618.3591777)".
+This project is in the process of being organized and will be updated continuously, so stay tuned.
+If you have any questions related to the paper, feel free to contact Yu-an Liu (liuyuan1b@ict.ac.cn).
 
 ## Introduction
 ![Overview](./figures/TARA.png)
