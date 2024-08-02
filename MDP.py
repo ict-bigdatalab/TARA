@@ -15,6 +15,9 @@ import dataloader
 import os
 import random
 import copy
+import torch.nn.functional as F
+import json
+from sentence_transformers import SentenceTransformer, util as st_util
 
 class SurrogateModel(nn.Module):
     def __init__(self, pretrained_model='bert-base-uncased', num_labels=2):
@@ -30,12 +33,14 @@ class RLAgent:
         self.tokenizer = tokenizer
         self.reward_function = reward_function
         self.action_space = action_space
+        self.policy_network = PolicyNetwork(input_dim=768, output_dim=len(action_space))  # Assume input_dim matches BERT hidden size
+        self.optimizer = AdamW(self.policy_network.parameters(), lr=1e-3)
 
     def trigger_generation(self, document, max_trigger_length=5):
         trigger = []
         for _ in range(max_trigger_length):
             input_text = " ".join(trigger) + " [MASK]"
-            inputs = self.tokenizer(input_text, return_tensors='pt')
+            inputs = self.tokenizer(input_text, return_tensors='pt').to('cuda')
             outputs = self.surrogate_model(**inputs)
             logits = outputs.logits
             next_word_id = torch.argmax(logits, dim=-1).item()
@@ -53,9 +58,35 @@ class RLAgent:
         return " ".join(words)
 
     def calculate_reward(self, original_doc, perturbed_doc, query):
-        original_score = self.surrogate_model(self.tokenizer(query + original_doc, return_tensors='pt')).logits
-        perturbed_score = self.surrogate_model(self.tokenizer(query + perturbed_doc, return_tensors='pt')).logits
-        return self.reward_function(original_score, perturbed_score)
+        original_score = self.surrogate_model(self.tokenizer(query + original_doc, return_tensors='pt').to('cuda')).logits
+        perturbed_score = self.surrogate_model(self.tokenizer(query + perturbed_doc, return_tensors='pt').to('cuda')).logits
+        semantic_sim = self.semantic_similarity(original_doc, perturbed_doc)
+        return self.reward_function(original_score, perturbed_score) + semantic_sim
+
+    def semantic_similarity(self, doc1, doc2):
+        # Assuming the sentence transformer model is loaded
+        embed1 = sentence_transformer.encode(doc1, convert_to_tensor=True)
+        embed2 = sentence_transformer.encode(doc2, convert_to_tensor=True)
+        similarity = st_util.pytorch_cos_sim(embed1, embed2)
+        return similarity.item()
+
+    def update_policy(self, rewards, log_probs, gamma=0.99):
+        returns = self.compute_returns(rewards, gamma)
+        policy_loss = []
+        for log_prob, R in zip(log_probs, returns):
+            policy_loss.append(-log_prob * R)
+        self.optimizer.zero_grad()
+        policy_loss = torch.cat(policy_loss).sum()
+        policy_loss.backward()
+        self.optimizer.step()
+
+    def compute_returns(self, rewards, gamma):
+        R = 0
+        returns = []
+        for r in reversed(rewards):
+            R = r + gamma * R
+            returns.insert(0, R)
+        return returns
 
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim, output_dim):
@@ -65,16 +96,9 @@ class PolicyNetwork(nn.Module):
     def forward(self, x):
         return torch.softmax(self.fc(x), dim=-1)
 
-class TriggerPolicyNetwork(PolicyNetwork):
-    def __init__(self, input_dim, vocab_size):
-        super(TriggerPolicyNetwork, self).__init__(input_dim, vocab_size)
-
-class WordSubstitutionPolicyNetwork(PolicyNetwork):
-    def __init__(self, input_dim, vocab_size):
-        super(WordSubstitutionPolicyNetwork, self).__init__(input_dim, vocab_size)
-
 def reward_function(original_score, perturbed_score):
-    return torch.max(torch.tensor(0), original_score - perturbed_score)
+    # Reward is a combination of score difference and semantic similarity
+    return torch.max(torch.tensor(0.0), original_score - perturbed_score)
 
 def main():
     # Parameters
@@ -92,6 +116,7 @@ def main():
     # Load models and tokenizers
     tokenizer = AutoTokenizer.from_pretrained(target_model_path)
     surrogate_model = SurrogateModel(pretrained_model=target_model_path, num_labels=num_labels).to('cuda')
+    sentence_transformer = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')  # Load USE or similar
 
     # Load data
     dataset = load_dataset(dataset_path)
@@ -115,8 +140,42 @@ def main():
                 loss.backward()
                 optimizer.step()
         
+        # Train RL agent
+        num_episodes = 1000
+        max_steps = 10  # Adjust based on problem complexity
+
+        for episode in range(num_episodes):
+            total_reward = 0
+            log_probs = []
+            rewards = []
+            state = random.choice(documents)  # Initial document
+            query = random.choice(queries)    # Randomly choose a query
+
+            for step in range(max_steps):
+                action_probs = rl_agent.policy_network(torch.FloatTensor(sentence_transformer.encode(state, convert_to_tensor=True)).to('cuda'))
+                action_dist = torch.distributions.Categorical(action_probs)
+                action = action_dist.sample()
+                log_prob = action_dist.log_prob(action)
+                log_probs.append(log_prob)
+
+                if action.item() == 0:
+                    perturbed_doc = rl_agent.trigger_generation(state)
+                else:
+                    perturbed_doc = rl_agent.word_substitution(state, synonyms={'word': ['synonym1', 'synonym2']})
+
+                reward = rl_agent.calculate_reward(state, perturbed_doc, query)
+                rewards.append(reward)
+                total_reward += reward
+
+                state = perturbed_doc
+
+            rl_agent.update_policy(rewards, log_probs)
+
+            if episode % 100 == 0:
+                print(f"Episode {episode}, Total Reward: {total_reward}")
+
         # Save trained model
-        surrogate_model.save_pretrained(output_dir)
+        torch.save(rl_agent.policy_network.state_dict(), os.path.join(output_dir, 'policy_network.pth'))
 
     elif mode == 'eval':
         # Evaluate RL agent
